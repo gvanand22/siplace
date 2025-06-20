@@ -1,0 +1,127 @@
+// PCBREGION.sob
+
+#version "2.5.2"
+
+    package "SvWrapPhotometricStereo.dll";
+
+    Transformation sensorTransformation = TRANSFORMATION;
+	
+	// Prüfe, ob die Kamera die 4 Sektoren der blauen Beleuchtung auch getrennt ansteuern kann
+	Bool bBlueIllumIsPSCapable= false;
+	IsBlueIllumPSCapable(SENSOR, bBlueIllumIsPSCapable);
+	
+	// Standard-Beleuchtung
+    IntVector illumParams;
+    illum ManipIllum##SST manipIllum##SST() {
+        illumParams = StandardIllum(DIPF);
+    }
+
+	// Erzeuge alle notwendigen Infos über die Beleuchtung (Beleuchtungswinkel, welche Ebene entspricht welchem Winkel, ...)
+	Bool bIllumDataValid= false;
+	Int  nDefault2DIllum = 0;	// default illumination strength for "normal" 2D images of PCB region
+	Int  nDefaultPSIllum = 0;	// default illumination strength for acquiring the photometric-stereo images with slanted illumination
+	GenerateIllumInfo(SENSOR, illumParams, vecSlantAngles, vecTiltAngles, vecIllumLevelMapping, nBlueIllumBoostFac, nDefault2DIllum, nDefaultPSIllum, bIllumDataValid);
+	
+	// Hole max. Binning
+	Int nMaxBinning = MaxBinning(SENSOR);
+	Debug("Max. Binning", nMaxBinning);
+	
+    // lade check PCB Modell aus manip-Datei (oder setzte teach required-flag)
+    CheckPCBModel deserializedModel;
+    XMLData 			xmlDefaultCheckPCBModel = "EMPTY";
+    params ManipParamXMLData manipCheckPCBModel() 
+    {
+    	XMLData xmlCheckPCBModel = "";
+    }
+
+    DeserializeCheckPCBModel(xmlCheckPCBModel, DIPF, nDefault2DIllum, nDefaultPSIllum, deserializedModel);
+
+	// prüfe, ob ein gultiges, vollständiges Modell für diesen SST verfügbar ist
+	Bool bModelValid= false;
+	Bool bModelEmpty= false;
+	IsPCBModelValid(deserializedModel, bModelValid, bModelEmpty);
+    if ( !bModelValid ) 
+    {
+	    // setze teach areas, wenn 1.) Modell noch leer (lt. internem Status) + 2.) noch keine teach areas gesetzt
+		DeriveTeachAreasFromDipf(DIPF, sensorTransformation, deserializedModel); // setze Teach Areas anhand der Dipf-Gruppen
+	}
+	if ( bModelEmpty )
+	{
+		// Setze Standard-Beleuchtung
+        TeachRequiredStatic();
+	}
+    
+    // set default model for Teach GUI
+    SerializeCheckPCBModel(deserializedModel, xmlDefaultCheckPCBModel);
+    default manipCheckPCBModel(xmlDefaultCheckPCBModel);
+
+main:
+
+    Transformation trans = sensorTransformation;
+    SvOPartPosition positionResult;
+
+    SvOPartPosition positionTolerance;
+    positionTolerance = ACTUAL.partTolerance;
+    positionTolerance.fQuality = 1.0;            // not used
+
+    SvOPartPosition targetPosition;
+    targetPosition = ACTUAL.partPosition;
+    targetPosition.fQuality = 1.0;               // not used
+    
+    EnableFeature("PCB_INSPECT_WIZARD",1L); 	// PCB Inspection Wizard freischalten
+	SetGUIUserLevel("EDIT_DIPF",100L); 			// Dipf nicht editierbar
+	SetGUIUserLevel("ROBUSTNESS",100L); 		// Robustheitsanalyse nicht anbieten
+    //DumpRequired(true);                         // aktuell "Dump always" deaktiviert
+   
+    if (!bBlueIllumIsPSCapable || !bIllumDataValid)
+    {
+        positionResult.fQuality = -0.1;
+		result Position is positionResult;
+		result PCBInspect is positionResult;
+    }
+
+	// ziehe vier Bilder mit vier unterschiedlichen Beleuchtungen ein
+    ImageRefVector images;
+    RobotPositionList robotPositions;
+    IllumDataList illums;
+	
+	// Ablauf: 
+	// 1.) berechne MFOV-Bildpositionen anhand aktueller Tranformation neu (GetMFOVPCBInspect) 
+	// 2.) starte CheckPCB-Auswertung (InspectPCBRegionMFOV) 
+	// a.) ziehe iterativ Bilder an allen Roboterpositionen ein
+	// b.) Sind alle vier Bilder einer Pos. vorhanden, wird parallel zum Bildeinzug die Berechnung des 
+	//     max.-Intensitätsbildes sowie der der Neigungskarten mit 3-out4- PS gestartet
+	// c.) sind alle SFOV's abgearbeitet, werden die virtuellen Bilder berechnet und zu den Teachdaten ausgerichtet
+	// d.) Suche nach Defekten anhand der zueinander ausgerichteten virtuellen Bilder
+	// Training des Modells ebenfalls durch Aufruf der Inspect-Wrapperfunktion 
+	// ob Training durchgeführt werden soll wird intern entschieden, dann findet in InspectPCBRegionMFOV ein
+	// iteratives SFOV-Training bei einer  Roboter-Position, nach Einzug aller Bilder dann das 
+	// "globales" Training (solder cue, etc.) statt
+	GetMFOVBinningPCBInspect(
+		DIPF, 
+		deserializedModel, 
+		targetPosition, 
+		positionTolerance, 
+		nDefaultBinning,
+		nMaxBinning,
+		nBlueIllumBoostFac, 
+		vecTiltAngles,          // in der hier definierten Reihenfolge sollen die Bilder pro robot position eingezogen werden
+		vecIllumLevelMapping,   // gibt die Zuordnung Index Bel-Ebene --> Bel.-Winkel (Tilt) dieser Ebene an
+		trans, 
+		images, 
+		robotPositions, 
+		illums);
+  	MultiAcquire(robotPositions, illums, trans, true); 	
+	InspectPCBRegionMFOV(targetPosition, images, vecSlantAngles, vecTiltAngles, vecIllumLevelMapping, deserializedModel, SENSOR, positionResult);
+
+	//positionResult.fQuality = 1.0;
+	//ClearInfo();
+		
+	if (bModelEmpty)
+	{
+		// positionResult.fQuality=0.0;
+		//TeachRequiredPCBInspect(); // setzt die Info-Nr.
+		TeachRequired(); // setzt die Info-Nr.
+	}
+
+    result PCBInspect is positionResult;
